@@ -20,8 +20,9 @@ from typing import Callable, List, Optional, Sequence, Tuple, TypeVar, Union
 import numpy as np
 import torch
 
-from monai.transforms.compose import Transform
-from monai.transforms.utils import map_binary_to_indices
+from monai.networks.layers import GaussianFilter
+from monai.transforms.compose import Randomizable, Transform
+from monai.transforms.utils import get_extreme_points, map_binary_to_indices
 from monai.utils import ensure_tuple
 
 # Generic type which can represent either a numpy.ndarray or a torch.Tensor
@@ -535,3 +536,79 @@ class FgBgToIndices(Transform):
             bg_indices = np.stack([np.unravel_index(i, output_shape) for i in bg_indices])
 
         return fg_indices, bg_indices
+
+
+class AddExtremePointsChannel(Transform, Randomizable):
+    """
+    Add extreme points of label to the image as a new channel.
+
+    This transform will first get extreme points from label.
+    Then apply a gaussian filter on it.
+    And rescale the pixel values to be in range [rescale_min, rescale_max].
+    Finally, this will be added as a new channel for the image.
+
+    Note that the label should be of shape (1, spatial_dim1, [spatial_dim2, ...])
+
+    This transform is for pipelines inspired by Deep Extreme Cut (Maninis and Caelles et al. CVPR 2018).
+
+    Args:
+        label: the image to get extreme points from. Shape is (1, spatial_dim1, [, spatial_dim2, ...]).
+        background: Value to be consider as background, defaults to 0.
+        permutation: Random permutation amount to add to the points, defaults to 0.0.
+
+    """
+
+    def __init__(self, label: Optional[np.ndarray] = None, background: int = 0, permutation: float = 0.0) -> None:
+        self.label = label
+        self._background = background
+        self._permutation = permutation
+        self._points = []
+
+    def randomize(self, data=None) -> None:
+        self._points = get_extreme_points(
+            data[0], rand_state=self.R, background=self._background, permutation=self._permutation
+        )
+
+    def __call__(
+        self,
+        img: np.ndarray,
+        label: Optional[np.ndarray] = None,
+        sigma: Union[Sequence[float], float, Sequence[torch.Tensor], torch.Tensor] = 3.0,
+        rescale_min: float = -1.0,
+        rescale_max: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Args:
+            img: the image that we want to add new channel.
+            label: the image to get extreme points from. Shape is (1, spatial_dim1, [, spatial_dim2, ...]).
+            sigma: if a list of values, must match the count of spatial dimensions of input data,
+                and apply every value in the list to 1 spatial dimension. if only 1 value provided,
+                use it for all spatial dimensions.
+            rescale_min: minimum value of output data.
+            rescale_max: maximum value of output data.
+        """
+        label = self.label if label is None else label
+        if label is None:
+            raise ValueError("This transform required label array!")
+        if label.shape[0] != 1:
+            raise ValueError("Only support label with 1 channel!")
+
+        self.randomize(label)
+
+        # points to image
+        points_image = torch.zeros(label.shape[1:], dtype=torch.float)
+        for p in self._points:
+            points_image[p] = 1.0
+
+        # add channel and add batch
+        points_image = points_image.unsqueeze(0).unsqueeze(0)
+        gaussian_filter = GaussianFilter(img.ndim - 1, sigma=sigma)
+        points_image = gaussian_filter(points_image).squeeze(0).detach().numpy()
+
+        # rescale the points image to [rescale_min, rescale_max]
+        min_intensity = np.min(points_image)
+        max_intensity = np.max(points_image)
+        points_image = (points_image - min_intensity) / (max_intensity - min_intensity)
+        points_image = points_image * (rescale_max - rescale_min) + rescale_min
+
+        return np.concatenate([img, points_image], axis=0)
